@@ -3,6 +3,7 @@ package org.snomed.snowstorm.fhir.services;
 import ca.uhn.fhir.context.FhirContext;
 import ca.uhn.fhir.rest.annotation.*;
 import ca.uhn.fhir.rest.api.MethodOutcome;
+import ca.uhn.fhir.rest.api.server.IBundleProvider;
 import ca.uhn.fhir.rest.api.server.RequestDetails;
 import ca.uhn.fhir.rest.param.QuantityParam;
 import ca.uhn.fhir.rest.param.StringParam;
@@ -43,6 +44,16 @@ import static org.snomed.snowstorm.fhir.services.FHIRHelper.exception;
 public class FHIRValueSetProvider implements IResourceProvider, FHIRConstants {
 
 	private static final String RESOURCE_TYPE_VALUE_SET = "ValueSet";
+
+	/**
+	 * The most ValueSets one search can page through.
+	 *
+	 * Not a number we picked: Elasticsearch refuses a from+size beyond index.max_result_window,
+	 * which defaults to 10,000, so this is the store's own ceiling. It is enforced here so the
+	 * failure is an explicit OperationOutcome naming the limit rather than a truncated result or
+	 * a raw Elasticsearch error out of the depths.
+	 */
+	public static final int MAX_SEARCHABLE_VALUE_SETS = 10_000;
 
 	private final Logger logger = LoggerFactory.getLogger(getClass());
 
@@ -114,9 +125,30 @@ public class FHIRValueSetProvider implements IResourceProvider, FHIRConstants {
 		return outcome;
 	}
 
-	//See https://www.hl7.org/fhir/valueset.html#search
+	/**
+	 * List the stored ValueSets, honouring the paging and search parameters the endpoint declares.
+	 *
+	 * This used to return a fully materialised Bundle built from a page size chosen here rather
+	 * than by the caller -- PageRequest.of(0, 1_000) on the plain listing, so a client holding
+	 * 3,464 value sets saw 1,000 of them, got no next link, and had no way to tell. _count and
+	 * _offset were accepted and ignored, and the reported total came from before the in-memory
+	 * filter ran, so url=X&version=BOGUS answered "total 2" over an empty entry list.
+	 *
+	 * Returning an IBundleProvider hands the link building back to HAPI, which is the only party
+	 * that knows what the caller asked for.
+	 *
+	 * The paging itself stays here on purpose, because that is HAPI's contract and not a choice:
+	 * when a request carries _offset, ResponseBundleBuilder.offsetBuildResourceList asks the
+	 * provider for getResources(0, Integer.MAX_VALUE) and does not trim the result, on the
+	 * understanding that a provider declaring @Offset has already returned exactly one page.
+	 *
+	 * @see <a href="https://www.hl7.org/fhir/valueset.html#search">ValueSet search parameters</a>
+	 */
 	@Search
-	public Bundle findValueSets(
+	public IBundleProvider findValueSets(
+			// Count is fully qualified: the wildcard import of org.hl7.fhir.r4.model also has one.
+			@ca.uhn.fhir.rest.annotation.Count Integer count,
+			@Offset Integer offset,
 			@OptionalParam(name="_id") String id,
 			@OptionalParam(name="code") String code,
 			@OptionalParam(name="context") TokenParam context,
@@ -133,8 +165,7 @@ public class FHIRValueSetProvider implements IResourceProvider, FHIRConstants {
 			@OptionalParam(name="status") String status,
 			@OptionalParam(name="title") StringParam title,
 			@OptionalParam(name="url") UriType url,
-			@OptionalParam(name="version") StringParam version,
-			RequestDetails requestDetails) {
+			@OptionalParam(name="version") StringParam version) {
 
 		SearchFilter vsFilter = new SearchFilter()
 				.withId(id)
@@ -155,41 +186,81 @@ public class FHIRValueSetProvider implements IResourceProvider, FHIRConstants {
 				.withUrl(url)
 				.withVersion(version);
 
-		Bundle bundle = new Bundle();
-		bundle.setType(Bundle.BundleType.SEARCHSET);
-
-		Stream<ValueSet> stream;
 		if (url != null) {
-			List<FHIRValueSet> allByUrl = valuesetRepository.findAllByUrl(url.getValueAsString());
-			stream = allByUrl.stream()
+			// A canonical url resolves to a handful of versions at most, so the whole set is read
+			// and filtered here. The reported total is now the filtered count: it used to be
+			// allByUrl.size(), taken before the filter ran, so url=X&version=BOGUS reported a
+			// total of 2 alongside zero entries.
+			return FHIRPagedSearchResult.of(count, offset, asListing(valuesetRepository.findAllByUrl(url.getValueAsString()).stream()
 					.map(FHIRValueSet::getHapi)
-					.filter(vs -> vsFilter.apply(vs, fhirHelper));
-			bundle.setTotal(allByUrl.size());
+					.filter(vs -> vsFilter.apply(vs, fhirHelper))));
 
 		} else if (vsFilter.anySearchParams()) {
-			Page<FHIRValueSet> all = valueSetService.findAll(PageRequest.of(0, 10_000));
-			stream = StreamSupport.stream(all.spliterator(), false)
+			// Every search parameter other than url is applied in memory, so the whole store has
+			// to be walked before the matches are known. Elasticsearch will not serve a window
+			// past MAX_SEARCHABLE_VALUE_SETS, so if the store has outgrown that, say so rather
+			// than filter a truncated slice and present the result as the answer.
+			Page<FHIRValueSet> all = valueSetService.findAll(PageRequest.of(0, MAX_SEARCHABLE_VALUE_SETS));
+			requireWholeStoreSearchable(all.getTotalElements());
+			return FHIRPagedSearchResult.of(count, offset, asListing(all.stream()
 					.map(FHIRValueSet::getHapi)
-					.filter(vs -> vsFilter.apply(vs, fhirHelper));
-			bundle.setTotal((int) all.getTotalElements());
+					.filter(vs -> vsFilter.apply(vs, fhirHelper))));
 
 		} else {
-			Page<FHIRValueSet> all = valueSetService.findAll(PageRequest.of(0, 1_000));
-			stream = all.stream()
-					.map(FHIRValueSet::getHapi);
-			bundle.setTotal((int) all.getTotalElements());
+			return storedValueSetListing(count, offset);
 		}
-		String fhirServerBase = requestDetails.getFhirServerBase();
-		bundle.setEntry(stream
+	}
+
+	/**
+	 * Strip compose and collect, for a search result rather than an expansion.
+	 *
+	 * The fullUrl each entry used to carry is not lost: HAPI sets it from the resource id and the
+	 * server base when it builds the bundle, which is where that knowledge belongs.
+	 */
+	private static List<IBaseResource> asListing(Stream<ValueSet> valueSets) {
+		return valueSets
 				.map(vs -> {
 					vs.setCompose(null);// Remove compose element from ValueSet search/listing
-					Bundle.BundleEntryComponent component = new Bundle.BundleEntryComponent();
-					component.setFullUrl(vs.getIdElement().withServerBase(fhirServerBase, RESOURCE_TYPE_VALUE_SET).getValue());
-					component.setResource(vs);
-					return component;
+					return (IBaseResource) vs;
 				})
-				.toList());
-		return bundle;
+				.toList();
+	}
+
+	/**
+	 * Refuse a search that cannot be answered completely, rather than answer part of it silently.
+	 *
+	 * Only reachable once the store holds more value sets than Elasticsearch will page through.
+	 * A caller who hits this can still reach any individual value set by url.
+	 */
+	private static void requireWholeStoreSearchable(long storedValueSets) {
+		if (storedValueSets > MAX_SEARCHABLE_VALUE_SETS) {
+			throw exception(String.format("This server holds %s ValueSets, more than the %s a single search can page " +
+							"through, so this search cannot be answered completely. Narrow it with the 'url' parameter.",
+					storedValueSets, MAX_SEARCHABLE_VALUE_SETS), IssueType.TOOCOSTLY, 400);
+		}
+	}
+
+	/**
+	 * The unfiltered listing of every stored ValueSet, read from Elasticsearch a window at a time.
+	 *
+	 * Lazy rather than materialised because that is the point of the change: the old code fixed the
+	 * page size at PageRequest.of(0, 1_000) before HAPI ever saw the request, which is what made
+	 * _count unimplementable and hid 2,464 of our 3,464 value sets behind a bundle that looked whole.
+	 */
+	private FHIRPagedSearchResult storedValueSetListing(Integer count, Integer offset) {
+		// Counted once, up front. HAPI asks size() repeatedly while building the response and uses
+		// it for the next/previous link arithmetic, so it must not move underneath them.
+		int total = (int) valueSetService.findAll(PageRequest.of(0, 1)).getTotalElements();
+		requireWholeStoreSearchable(total);
+
+		return new FHIRPagedSearchResult(count, offset, total, (fromIndex, toIndex) -> {
+			// Elasticsearch pages by from+size, but Pageable only expresses whole pages of equal
+			// size and the requested window need not line up with one. So read from the start of
+			// the index and slice. toIndex is bounded by MAX_SEARCHABLE_VALUE_SETS through the
+			// check above, which is the same bound Elasticsearch puts on from+size anyway.
+			List<FHIRValueSet> window = valueSetService.findAll(PageRequest.of(0, toIndex)).getContent();
+			return asListing(window.subList(fromIndex, toIndex).stream().map(FHIRValueSet::getHapi));
+		});
 	}
 
 	@Operation(name = "$expand", idempotent = true)
