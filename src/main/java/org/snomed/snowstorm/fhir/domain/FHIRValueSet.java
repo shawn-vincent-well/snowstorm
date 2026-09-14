@@ -18,6 +18,12 @@ import static org.snomed.snowstorm.core.util.CollectionUtils.orEmpty;
 @Document(indexName = "#{@indexNameProvider.indexName('fhir-value-set')}", createIndex = false)
 public class FHIRValueSet {
 
+	public interface Fields {
+
+		String URL = "url";
+		String VERSION = "version";
+	}
+
 	@Id
 	private String id;
 

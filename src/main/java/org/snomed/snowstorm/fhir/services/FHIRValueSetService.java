@@ -172,9 +172,17 @@ public class FHIRValueSetService implements FHIRConstants {
 		this.warningsService = warningsService;
 	}
 
+	/**
+	 * Sorted on purpose. An unsorted Elasticsearch query has no defined order across shards or
+	 * across repeated executions, so paging one with from+size can return the same value set on
+	 * two pages and never return another -- which is exactly the silent data loss that the paged
+	 * ValueSet search exists to remove. url then version is also a more useful
+	 * listing order for a caller than index order.
+	 */
 	public Page<FHIRValueSet> findAll(Pageable pageable) {
 		NativeQuery searchQuery = new NativeQueryBuilder()
 				.withPageable(pageable)
+				.withSort(Sort.by(FHIRValueSet.Fields.URL, FHIRValueSet.Fields.VERSION))
 				.build();
 		searchQuery.setTrackTotalHits(true);
 		SearchHits<FHIRValueSet> search = elasticsearchOperations.search(searchQuery, FHIRValueSet.class);
