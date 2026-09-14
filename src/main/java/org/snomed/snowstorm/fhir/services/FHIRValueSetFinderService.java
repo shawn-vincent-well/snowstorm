@@ -425,6 +425,11 @@ public class FHIRValueSetFinderService implements FHIRConstants, TxResourceAware
 			// The display clause keeps its 2.0f boost so that if this ever becomes a scored
 			// context an exact display hit outranks a designation hit. Today it cannot: this is
 			// a filter clause, which is unscored, and the caller sorts by displayLen regardless.
+			//
+			// FHIRValueSetService.designationMatchPredicateForIndexedFilter re-evaluates this
+			// same rule in Java, to report which designation matched. Re-tune the clause below
+			// and that predicate has to be re-tuned with it, or the expansion will start naming
+			// a match reason that is not the one Elasticsearch actually used.
 			masterQuery.filter(bool()
 					.should(Queries.queryStringQuery(FHIRConcept.Fields.DISPLAY, query, Operator.And, 2.0f)._toQuery())
 					.should(Queries.queryStringQuery(FHIRConcept.Fields.DESIGNATION_VALUE, query, Operator.And, 1.0f)._toQuery())

@@ -3,6 +3,7 @@ package org.snomed.snowstorm.fhir.services;
 import co.elastic.clients.elasticsearch._types.query_dsl.BoolQuery;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import org.apache.commons.lang3.tuple.Pair;
+import org.apache.lucene.analysis.standard.StandardAnalyzer;
 import org.hl7.fhir.r4.model.*;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -32,6 +33,7 @@ import org.springframework.data.elasticsearch.core.SearchHits;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -269,13 +271,26 @@ public class FHIRValueSetService implements FHIRConstants {
 
 		boolean includeDesignations = TRUE.equals(params.getIncludeDesignations());
 		Page<FHIRConcept> conceptsPage;
+		// Tells the expansion which designation values the filter matched, so a
+		// designation-only hit can carry the text that made it relevant instead of only a display
+		// the caller never typed. Built per path because the three paths do not filter alike, and
+		// a reporter that does not match its own path's filter either invents a match reason or
+		// silently drops one -- see designationMatchPredicateForIndexedFilter below. null when
+		// there is nothing to report.
+		Predicate<String> designationMatch;
 		if (isSnomed) {
 			conceptsPage = expandSnomedConceptsPage(allInclusionVersions, codeSelectionCriteria, filter, activeOnly, pageRequest, params, displayLanguage, includeDesignations);
+			// SNOMED is untouched by this patch and by patch 8: its filter runs over descriptions,
+			// its display comes from SNOMED acceptability, and with includeDesignations false its
+			// designations are not even populated.
+			designationMatch = null;
 		} else if (allInclusionVersions.stream().allMatch(v -> v.getInlineCodeSystem() != null)) {
 			// All inclusion versions carry inline concepts from the tx-resource overlay — expand in-memory.
 			conceptsPage = buildInlineConceptsPage(allInclusionVersions, codeSelectionCriteria, filter, activeOnly, pageRequest);
+			designationMatch = designationMatchPredicateForInlineFilter(filter);
 		} else {
 			conceptsPage = expandFhirConceptsPage(codeSelectionCriteria, filter, pageRequest);
+			designationMatch = designationMatchPredicateForIndexedFilter(filter);
 		}
 		// Only SNOMED expansions carry the SNOMED copyright notice.
 		String copyright = isSnomed ? SNOMED_VALUESET_COPYRIGHT : null;
@@ -303,7 +318,7 @@ public class FHIRValueSetService implements FHIRConstants {
 
 		final String fhirDisplayLanguage = determineFhirDisplayLanguage(params, displayLanguage, expansion, hapiValueSet);
 
-		return finalizeExpansion(hapiValueSet, expansion, conceptsPage, versionMaps, params, fhirDisplayLanguage, copyright);
+		return finalizeExpansion(hapiValueSet, expansion, conceptsPage, versionMaps, params, fhirDisplayLanguage, copyright, designationMatch);
 	}
 
 	private void applyVersionValueSetOverride(ValueSet hapiValueSet, ValueSetExpansionParameters params) {
@@ -627,8 +642,8 @@ public class FHIRValueSetService implements FHIRConstants {
 	// Builds the expansion contents, sets totals, marks unclosed/copyright, and clears the compose if not requested.
 	private ValueSet finalizeExpansion(ValueSet hapiValueSet, ValueSet.ValueSetExpansionComponent expansion,
 			Page<FHIRConcept> conceptsPage, ExpansionVersionMaps versionMaps, ValueSetExpansionParameters params,
-			String fhirDisplayLanguage, String copyright) {
-		List<ValueSet.ValueSetExpansionContainsComponent> expansionContents = createExpansionContents(conceptsPage, hapiValueSet, versionMaps.idAndVersionToLanguage, versionMaps.idAndVersionToUrl, versionMaps.idToVersionStr, versionMaps.multipleIncludes, expansion, params, fhirDisplayLanguage);
+			String fhirDisplayLanguage, String copyright, Predicate<String> designationMatch) {
+		List<ValueSet.ValueSetExpansionContainsComponent> expansionContents = createExpansionContents(conceptsPage, hapiValueSet, versionMaps.idAndVersionToLanguage, versionMaps.idAndVersionToUrl, versionMaps.idToVersionStr, versionMaps.multipleIncludes, expansion, params, fhirDisplayLanguage, designationMatch);
 		expansion.setContains(expansionContents);
 		expansion.setTotal((int) conceptsPage.getTotalElements());
 		Optional.ofNullable(params.getOffset()).ifPresent(expansion::setOffset);
@@ -798,6 +813,65 @@ public class FHIRValueSetService implements FHIRConstants {
 		return excludedCodes;
 	}
 
+	// Reports WHICH designation values an Elasticsearch-backed term filter matched. Widening the
+	// filter to designations without this leaves the response showing display alone, so a filter
+	// matching only a designation returns concepts labelled with a string the caller never typed
+	// and may not recognise -- the capability half delivered.
+	//
+	// This has to mirror FHIRValueSetFinderService.getFhirConceptQuery exactly -- same analyzer,
+	// every filter token required, every token treated as a prefix, which is what
+	// `queryStringQuery(field, "tok1* tok2*", Operator.And)` does. Report a designation the query
+	// did NOT match and we make a false claim about why the concept is in the result; fail to
+	// report one it DID match and the caller is left with the same silent gap this patch exists to
+	// close. If patch 8's clause is ever re-tuned, re-tune this with it.
+	//
+	// Returns null when there is nothing to report: no filter, or a filter that analyzes to no
+	// tokens at all (punctuation only), which the query would not have narrowed on either.
+	@Nullable
+	static Predicate<String> designationMatchPredicateForIndexedFilter(String termFilter) {
+		if (termFilter == null || termFilter.isBlank()) {
+			return null;
+		}
+		List<String> filterTokens = DescriptionService.analyze(termFilter, new StandardAnalyzer());
+		if (filterTokens.isEmpty()) {
+			return null;
+		}
+		return value -> {
+			if (value == null) {
+				return false;
+			}
+			List<String> valueTokens = DescriptionService.analyze(value, new StandardAnalyzer());
+			return filterTokens.stream().allMatch(filterToken ->
+					valueTokens.stream().anyMatch(valueToken -> valueToken.startsWith(filterToken)));
+		};
+	}
+
+	// The same reporter for the inline (tx-resource overlay) path. It deliberately does NOT share
+	// the analyzed rule above,
+	// because buildInlineConceptIfIncluded does not filter by that rule: it does a plain
+	// case-insensitive substring test, which matches infixes the Elasticsearch query would miss
+	// ("days" inside "Weekdays") and misses reordered multi-word filters the Elasticsearch query
+	// would match. Reusing one rule for both paths would therefore report designations that did
+	// not drive an inline match, and stay silent on inline matches that did.
+	@Nullable
+	static Predicate<String> designationMatchPredicateForInlineFilter(String filter) {
+		if (filter == null || filter.isBlank()) {
+			return null;
+		}
+		String lowerFilter = filter.toLowerCase();
+		return value -> value != null && value.toLowerCase().contains(lowerFilter);
+	}
+
+	private static ValueSet.ConceptReferenceDesignationComponent toDesignationComponent(FHIRDesignation designation) {
+		ValueSet.ConceptReferenceDesignationComponent designationComponent = new ValueSet.ConceptReferenceDesignationComponent();
+		designationComponent.setLanguage(designation.getLanguage());
+		designationComponent.setUse(designation.getUseCoding());
+		designationComponent.setValue(designation.getValue());
+		Optional.ofNullable(designation.getExtensions()).orElse(emptyList())
+				.forEach(e -> designationComponent.addExtension(e.getHapi()));
+		return designationComponent;
+	}
+
 	// Returns the concept to include in the inline expansion, or null when it is excluded/filtered out.
 	private FHIRConcept buildInlineConceptIfIncluded(CodeSystem.ConceptDefinitionComponent def, FHIRCodeSystemVersion version,
 			Set<String> excludedCodes, Set<String> finalIncludedCodes, boolean activeOnly, String filter) {
@@ -948,13 +1022,13 @@ public class FHIRValueSetService implements FHIRConstants {
 		}
 	}
 
-	private List<ValueSet.ValueSetExpansionContainsComponent> createExpansionContents(Page<FHIRConcept> conceptsPage, ValueSet hapiValueSet, Map<String, String> idAndVersionToLanguage, Map<String, String> idAndVersionToUrl, Map<String, String> idToVersionStr, boolean multipleIncludes, ValueSet.ValueSetExpansionComponent expansion, ValueSetExpansionParameters params, String fhirDisplayLanguage) {
+	private List<ValueSet.ValueSetExpansionContainsComponent> createExpansionContents(Page<FHIRConcept> conceptsPage, ValueSet hapiValueSet, Map<String, String> idAndVersionToLanguage, Map<String, String> idAndVersionToUrl, Map<String, String> idToVersionStr, boolean multipleIncludes, ValueSet.ValueSetExpansionComponent expansion, ValueSetExpansionParameters params, String fhirDisplayLanguage, Predicate<String> designationMatch) {
 		return conceptsPage.stream()
-				.map(concept -> createExpansionContainsComponent(concept, hapiValueSet, idAndVersionToLanguage, idAndVersionToUrl, idToVersionStr, multipleIncludes, expansion, params, fhirDisplayLanguage))
+				.map(concept -> createExpansionContainsComponent(concept, hapiValueSet, idAndVersionToLanguage, idAndVersionToUrl, idToVersionStr, multipleIncludes, expansion, params, fhirDisplayLanguage, designationMatch))
 				.toList();
 	}
 
-	private ValueSet.ValueSetExpansionContainsComponent createExpansionContainsComponent(FHIRConcept concept, ValueSet hapiValueSet, Map<String, String> idAndVersionToLanguage, Map<String, String> idAndVersionToUrl, Map<String, String> idToVersionStr, boolean multipleIncludes, ValueSet.ValueSetExpansionComponent expansion, ValueSetExpansionParameters params, String fhirDisplayLanguage) {
+	private ValueSet.ValueSetExpansionContainsComponent createExpansionContainsComponent(FHIRConcept concept, ValueSet hapiValueSet, Map<String, String> idAndVersionToLanguage, Map<String, String> idAndVersionToUrl, Map<String, String> idToVersionStr, boolean multipleIncludes, ValueSet.ValueSetExpansionComponent expansion, ValueSetExpansionParameters params, String fhirDisplayLanguage, Predicate<String> designationMatch) {
 		List<ValueSet.ConceptReferenceComponent> references = hapiValueSet.getCompose().getInclude().stream()
 				.flatMap(set -> set.getConcept().stream()).filter(c -> c.getCode().equals(concept.getCode())).toList();
 
@@ -983,7 +1057,50 @@ public class FHIRValueSetService implements FHIRConstants {
 		});
 		addInfoFromReferences(component, references);
 		setDisplayAndDesignations(component, concept, idAndVersionToLanguage.get(concept.getCodeSystemVersion()), params.getIncludeDesignationsAsBool(), fhirDisplayLanguage, params.getDesignations());
+		addMatchedDesignations(component, concept, params, designationMatch);
 		return component;
+	}
+
+	// Say WHY this concept matched when the reason is not visible in the display.
+	//
+	// `display` is deliberately left alone. The code system's own display stays the label, which
+	// is generally why alternates were loaded as designations rather than as displays in the
+	// first place, and substituting one here would be the synonym hijack that the designation
+	// `use` ranking exists to prevent. Some servers do substitute, returning the matched synonym
+	// in `display`; this does not.
+	// ValueSet.expansion.contains.designation (0..*) is the slot FHIR R4 defines for exactly this,
+	// so the matched text rides alongside the display instead of replacing it.
+	//
+	// Only the designations that MATCHED, not all of them. Two reasons: the set is the answer to
+	// "what did I type that got me here", which the whole set is not; and a picker rendering every
+	// alternate name for every row is the noise this endpoint exists to cut through.
+	//
+	// Deliberately NOT gated on includeDesignations. That parameter already means "give me the
+	// concept's full designation set", it is handled by setDisplayAndDesignations above and its
+	// meaning is unchanged; gating on it would leave this patch dead for the default request, which
+	// is the request a type-ahead picker or a retrieval client actually sends, leaving the
+	// capability half delivered. When it IS set the full set is already present, matched
+	// entries included, so there is nothing to add and adding would duplicate.
+	//
+	// Must run AFTER setDisplayAndDesignations: buildComponentDesignations calls
+	// setDesignation(emptyList()) when includeDesignations is false, so anything added earlier is
+	// silently discarded. That call is also why this replaces the list rather than calling
+	// addDesignation -- emptyList() is immutable and addDesignation throws
+	// UnsupportedOperationException straight out to a 500.
+	private void addMatchedDesignations(ValueSet.ValueSetExpansionContainsComponent component, FHIRConcept concept,
+			ValueSetExpansionParameters params, Predicate<String> designationMatch) {
+		if (designationMatch == null || params.getIncludeDesignationsAsBool()) {
+			return;
+		}
+		List<ValueSet.ConceptReferenceDesignationComponent> matched = new ArrayList<>();
+		for (FHIRDesignation designation : concept.getDesignations()) {
+			if (designationMatch.test(designation.getValue())) {
+				matched.add(toDesignationComponent(designation));
+			}
+		}
+		if (!matched.isEmpty()) {
+			component.setDesignation(matched);
+		}
 	}
 
 	private void applyConceptPropertyToContains(String key, List<FHIRProperty> value, ValueSet.ValueSetExpansionContainsComponent component, ValueSet.ValueSetExpansionComponent expansion) {
