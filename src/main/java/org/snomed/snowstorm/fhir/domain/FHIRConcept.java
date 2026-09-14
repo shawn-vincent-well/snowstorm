@@ -195,7 +195,14 @@ public class FHIRConcept implements FHIRGraphNode {
 		TermLangPojo displayTerm = snomedConceptMini.getPt();
 		if (displayTerm == null || displayTerm.getTerm() == null) {
 			displayTerm = snomedConceptMini.getFsn();
-			if (displayTerm == null) {
+			// The TERM has to be tested here, not the pojo. DescriptionHelper's
+			// getPtDescriptionTermAndLang ends in `.orElse(new TermLangPojo())`, so getFsn()
+			// returns a non-null pojo whose term is null when no description matches the
+			// requested dialects. A `displayTerm == null` check therefore never fires, and
+			// setDisplay(null) is reached -- an $expand over a partially translated edition
+			// returns concepts with no display at all. `display` is 0..1 on an expansion
+			// contains, so the response stays schema-valid and nothing errors.
+			if (displayTerm == null || displayTerm.getTerm() == null) {
 				displayTerm = new TermLangPojo(code, "en");
 			}
 		}
@@ -260,6 +267,22 @@ public class FHIRConcept implements FHIRGraphNode {
 
 	public String getDisplay() {
 		return display;
+	}
+
+	/**
+	 * The first candidate that actually carries a term; null if none do.
+	 *
+	 * Public because FHIRHelper.getPreferredTerm needs the same PT -> FSN fallback, for the
+	 * same reason: getPt() and getFsn() return a NON-NULL TermLangPojo with a null term when
+	 * nothing matched, so the term must be tested rather than the pojo.
+	 */
+	public static TermLangPojo firstWithTerm(TermLangPojo... candidates) {
+		for (TermLangPojo candidate : candidates) {
+			if (candidate != null && candidate.getTerm() != null) {
+				return candidate;
+			}
+		}
+		return null;
 	}
 
 	public void setDisplay(String display) {

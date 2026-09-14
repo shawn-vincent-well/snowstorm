@@ -29,6 +29,9 @@ import java.util.regex.Pattern;
 
 import static java.lang.String.format;
 import static org.snomed.snowstorm.config.Config.DEFAULT_LANGUAGE_DIALECTS;
+import static org.snomed.snowstorm.core.util.CollectionUtils.orEmpty;
+import org.snomed.snowstorm.fhir.domain.FHIRConcept;
+import org.snomed.snowstorm.core.pojo.TermLangPojo;
 
 @Component
 public class FHIRHelper implements FHIRConstants {
@@ -306,14 +309,46 @@ public class FHIRHelper implements FHIRConstants {
 	}
 
 	public String getPreferredTerm(Concept concept, List<LanguageDialect> designations) {
-		if (designations == null || designations.isEmpty()) {
-			return concept.getPt().getTerm();
+		// Checking only designations.getFirst() and returning null when nothing matches
+		// lets $lookup answer with NO display, which `display` being 1..1 in R4 makes a
+		// conformance violation rather than a cosmetic gap. Walk every requested dialect,
+		// then the server default, then whatever the concept itself resolved to, and only
+		// then degrade to the concept id.
+		String requested = preferredSynonym(concept, orEmpty(designations));
+		if (requested != null) {
+			return requested;
 		}
+		// Nothing acceptable in any requested dialect. Try the server default
+		// (en-US / en-GB / en) before giving up. Without this an unsupported
+		// Accept-Language -- `de`, say -- yields no display at all, while the equivalent
+		// displayLanguage parameter yields English, so the same request is answered
+		// differently depending on how the language was expressed.
+		String fallback = preferredSynonym(concept, DEFAULT_LANGUAGE_DIALECTS);
+		if (fallback != null) {
+			return fallback;
+		}
+		// Next: whatever the concept itself resolved to. getPt()/getFsn() return a
+		// NON-NULL TermLangPojo with a null term when nothing matched
+		// (DescriptionHelper.getPtDescriptionTermAndLang ends in
+		// `.orElse(new TermLangPojo())`), so the TERM must be tested, not the pojo.
+		TermLangPojo own = FHIRConcept.firstWithTerm(concept.getPt(), concept.getFsn());
+		if (own != null) {
+			return own.getTerm();
+		}
+		// Last resort: the concept id. Reachable -- a concept with no active descriptions
+		// resolves nothing above -- and it keeps $lookup symmetric with $expand, which
+		// already degrades to the code rather than to a blank.
+		return concept.getConceptId();
+	}
 
-		for (Description d : concept.getDescriptions()) {
-			if (d.hasAcceptability(Concepts.PREFERRED, designations.getFirst()) &&
-					d.getTypeId().equals(Concepts.SYNONYM)) {
-				return d.getTerm();
+	/** First preferred synonym acceptable in any of the given dialects, in order. */
+	private static String preferredSynonym(Concept concept, List<LanguageDialect> dialects) {
+		for (LanguageDialect dialect : dialects) {
+			for (Description d : concept.getDescriptions()) {
+				if (d.hasAcceptability(Concepts.PREFERRED, dialect) &&
+						d.getTypeId().equals(Concepts.SYNONYM)) {
+					return d.getTerm();
+				}
 			}
 		}
 		return null;
