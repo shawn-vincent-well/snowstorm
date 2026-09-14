@@ -308,7 +308,7 @@ public class FHIRCodeSystemProvider implements IResourceProvider, FHIRConstants,
 			if (concept == null) {
 				throw exception(format("Code '%s' not found for system '%s'.", code, fhirCodeSystemVersion.getUrl()), IssueType.NOTFOUND, 404);
 			}
-			return pMapper.mapToFHIR(fhirCodeSystemVersion, concept);
+			return pMapper.mapToFHIR(fhirCodeSystemVersion, concept, designations, displayLanguage);
 		}
 	}
 
