@@ -6,6 +6,7 @@ import ca.uhn.fhir.jpa.term.TermLoaderSvcImpl;
 import ca.uhn.fhir.jpa.term.api.ITermLoaderSvc;
 import ca.uhn.fhir.rest.annotation.*;
 import ca.uhn.fhir.rest.api.MethodOutcome;
+import ca.uhn.fhir.rest.api.server.IBundleProvider;
 import ca.uhn.fhir.rest.api.server.RequestDetails;
 import ca.uhn.fhir.rest.param.QuantityParam;
 import ca.uhn.fhir.rest.param.StringParam;
@@ -114,10 +115,21 @@ public class FHIRCodeSystemProvider implements IResourceProvider, FHIRConstants,
 		);
 
 	//See https://www.hl7.org/fhir/valueset.html#search
+	/**
+	 * List the CodeSystems this server knows about, honouring the paging parameters.
+	 *
+	 * _count already worked here, because returning a List lets HAPI page it. _offset did not:
+	 * without an @Offset parameter HAPI hands the provider's whole result set to the client while
+	 * advertising a page, so GET /fhir/CodeSystem?_count=1&_offset=1 answered a page of one with
+	 * three entries. Same defect, and same fix, as the ValueSet listing.
+	 */
 	@Search
-	public List<CodeSystem> findCodeSystems(
+	public IBundleProvider findCodeSystems(
 			RequestDetails theRequest,
 			HttpServletResponse theResponse,
+			// Count is fully qualified: the wildcard import of org.hl7.fhir.r4.model also has one.
+			@ca.uhn.fhir.rest.annotation.Count Integer count,
+			@Offset Integer offset,
 			@OptionalParam(name="id") String id,
 			@OptionalParam(name="code") String code,
 			@OptionalParam(name="context") TokenParam context,
@@ -179,10 +191,12 @@ public class FHIRCodeSystemProvider implements IResourceProvider, FHIRConstants,
 		Stream<CodeSystem> fhirCodeSystemStream = StreamSupport.stream(fhirCodeSystemService.findAll().spliterator(), false)
 				.map(FHIRCodeSystemVersion::toHapiCodeSystem);
 
-		return concat(snomedCodeSystemStream, fhirCodeSystemStream)
+		List<IBaseResource> matches = concat(snomedCodeSystemStream, fhirCodeSystemStream)
 				.filter(cs -> csFilter.apply(cs, fhirHelper))
 				.sorted(chainedComparator)
+				.map(IBaseResource.class::cast)
 				.toList();
+		return FHIRPagedSearchResult.of(count, offset, matches);
 	}
 
 	@Read()

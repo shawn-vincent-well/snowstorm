@@ -3,6 +3,7 @@ package org.snomed.snowstorm.fhir.services;
 import ca.uhn.fhir.context.FhirContext;
 import ca.uhn.fhir.rest.annotation.*;
 import ca.uhn.fhir.rest.api.MethodOutcome;
+import ca.uhn.fhir.rest.api.server.IBundleProvider;
 import ca.uhn.fhir.rest.server.IResourceProvider;
 import org.springframework.web.bind.annotation.RequestMethod;
 import org.hl7.fhir.instance.model.api.IBaseResource;
@@ -61,19 +62,31 @@ public class FHIRConceptMapProvider implements IResourceProvider, FHIRConstants 
 	}
 
 	//See https://www.hl7.org/fhir/conceptmap.html#search
+	/**
+	 * List the ConceptMaps this server can offer, honouring the paging parameters.
+	 *
+	 * _count already worked here, because returning a List lets HAPI page it. _offset did not:
+	 * without an @Offset parameter HAPI hands the provider's whole result set to the client while
+	 * advertising a page. Same defect, and same fix, as the ValueSet listing. The
+	 * silent 1,000 cap that used to sit underneath this, in FHIRConceptMapService.findAll, went
+	 * with the same patch.
+	 */
 	@Search
-	public List<ConceptMap> findConceptMaps(
+	public IBundleProvider findConceptMaps(
 			HttpServletRequest theRequest,
 			HttpServletResponse theResponse,
+			// Count is fully qualified: the wildcard import of org.hl7.fhir.r4.model also has one.
+			@ca.uhn.fhir.rest.annotation.Count Integer count,
+			@Offset Integer offset,
 			@OptionalParam(name="url") String url) {
 
-		List<FHIRConceptMap> page = service.findAll();
-
-		return page.stream()
+		List<IBaseResource> matches = service.findAll().stream()
 				.filter(map -> url == null || url.equals(map.getUrl()))
 				.map(FHIRConceptMap::getHapi)
 				.map(map -> { map.setGroup(null); return map; })// Clear groups for display listing
+				.map(IBaseResource.class::cast)
 				.toList();
+		return FHIRPagedSearchResult.of(count, offset, matches);
 	}
 
 	@Operation(name="$translate", idempotent=true)

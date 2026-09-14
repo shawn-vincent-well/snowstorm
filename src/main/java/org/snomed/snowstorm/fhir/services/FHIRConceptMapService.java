@@ -49,6 +49,12 @@ public class FHIRConceptMapService {
 
 	private static final PageRequest PAGE_OF_ONE_THOUSAND = PageRequest.of(0, 1_000);
 
+	/**
+	 * The most stored ConceptMaps one listing can page through. Elasticsearch refuses a from+size
+	 * beyond index.max_result_window, which defaults to 10,000, so this is the store's own ceiling.
+	 */
+	private static final int MAX_SEARCHABLE_CONCEPT_MAPS = 10_000;
+
 	private final FHIRConceptMapRepository conceptMapRepository;
 
 	private final ElasticsearchOperations elasticsearchOperations;
@@ -146,11 +152,26 @@ public class FHIRConceptMapService {
 		return null;
 	}
 
+	/**
+	 * Every ConceptMap this server can offer: the generated implicit SNOMED maps, then the stored ones.
+	 *
+	 * This used to read a page of 1_000 minus the implicit maps, under a comment reading "Load first
+	 * 1000 until we can figure out pagination", and say nothing when there were more. HAPI pages the
+	 * list this returns, so a caller saw a bundle with a plausible total and a next link over a set
+	 * that had already been cut. It also threw IllegalArgumentException rather than anything
+	 * meaningful once the implicit maps alone reached 1_000, because the page size went to zero.
+	 *
+	 * Reading the lot and refusing loudly past the ceiling is the honest version.
+	 */
 	public List<FHIRConceptMap> findAll() {
-		// Load first 1000 until we can figure out pagination
 		List<FHIRConceptMap> maps = new ArrayList<>(hasAnyImportedSnomedVersion() ? getSnomedMaps() : List.of());
-		PageRequest pageRequest = PageRequest.of(0, PAGE_OF_ONE_THOUSAND.getPageSize() - maps.size());
-		maps.addAll(conceptMapRepository.findAll(pageRequest).getContent());
+		Page<FHIRConceptMap> stored = conceptMapRepository.findAll(PageRequest.of(0, MAX_SEARCHABLE_CONCEPT_MAPS));
+		if (stored.getTotalElements() > MAX_SEARCHABLE_CONCEPT_MAPS) {
+			throw exception(String.format("This server holds %s ConceptMaps, more than the %s a single listing can " +
+							"page through, so GET /ConceptMap cannot answer completely. Fetch a map by id or url instead.",
+					stored.getTotalElements(), MAX_SEARCHABLE_CONCEPT_MAPS), OperationOutcome.IssueType.TOOCOSTLY, 400);
+		}
+		maps.addAll(stored.getContent());
 		return maps;
 	}
 
