@@ -15,6 +15,11 @@ public class FHIRProperty {
 	public static final String INTEGER_TYPE = "INTEGER";
 	public static final String DECIMAL_TYPE = "DECIMAL";
 	public static final String ID_TYPE = "ID";
+	// dateTime completes the set alongside BOOLEAN, INTEGER and DECIMAL. A concept property
+	// carrying a date -- effectiveDate and retirementDate are the common ones in a released
+	// terminology -- was stored with a null value, so it was absent from $lookup entirely
+	// rather than being returned in the wrong form.
+	public static final String DATETIME_TYPE = "DATETIME";
 
 	protected static final String[] URLS = {"http://hl7.org/fhir/StructureDefinition/itemWeight",
 			"http://hl7.org/fhir/StructureDefinition/codesystem-label",
@@ -75,6 +80,9 @@ public class FHIRProperty {
 		} else if (propertyComponent.hasValueDecimalType()){
 			value = propertyComponent.getValueDecimalType().getValueAsString();
 			type = DECIMAL_TYPE;
+		} else if (propertyComponent.hasValueDateTimeType()) {
+			value = propertyComponent.getValueDateTimeType().getValueAsString();
+			type = DATETIME_TYPE;
 		}
 	}
 
@@ -113,7 +121,11 @@ public class FHIRProperty {
 			return new IntegerType(value);
 		}else if (DECIMAL_TYPE.equals(type)) {
 			return new DecimalType(value);
+		} else if (DATETIME_TYPE.equals(type)) {
+			return new DateTimeType(value);
 		}
+		// NOTE: ID_TYPE is declared above but has no branch here, so an id-valued property
+		// still returns null. Left alone as a separate issue rather than changed in passing.
 		return null;
 	}
 
