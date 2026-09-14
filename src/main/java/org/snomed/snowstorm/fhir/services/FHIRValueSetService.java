@@ -261,7 +261,7 @@ public class FHIRValueSetService implements FHIRConstants {
 		// Restrict the expansion of ValueSets with multiple code system versions if any are SNOMED CT, to simplify pagination.
 		Set<FHIRCodeSystemVersion> allInclusionVersions = codeSelectionCriteria.gatherAllInclusionVersions();
 		boolean isSnomed = allInclusionVersions.stream().anyMatch(FHIRCodeSystemVersion::isOnSnomedBranch);
-		validateSnomedExpansionSupported(isSnomed, allInclusionVersions);
+		validateSnomedExpansionSupported(isSnomed, allInclusionVersions, codeSelectionCriteria);
 
 		if (allInclusionVersions.isEmpty()) {
 			return hapiValueSet;
@@ -269,7 +269,11 @@ public class FHIRValueSetService implements FHIRConstants {
 
 		boolean includeDesignations = TRUE.equals(params.getIncludeDesignations());
 		Page<FHIRConcept> conceptsPage;
-		if (isSnomed) {
+		if (isSnomed && allInclusionVersions.size() > 1) {
+			// Bounded by construction, so it is gathered whole rather than paged per store.
+			conceptsPage = buildEnumeratedMixedConceptsPage(allInclusionVersions, codeSelectionCriteria, filter,
+					activeOnly, pageRequest, params, displayLanguage, includeDesignations);
+		} else if (isSnomed) {
 			conceptsPage = expandSnomedConceptsPage(allInclusionVersions, codeSelectionCriteria, filter, activeOnly, pageRequest, params, displayLanguage, includeDesignations);
 		} else if (allInclusionVersions.stream().allMatch(v -> v.getInlineCodeSystem() != null)) {
 			// All inclusion versions carry inline concepts from the tx-resource overlay — expand in-memory.
@@ -329,8 +333,23 @@ public class FHIRValueSetService implements FHIRConstants {
 	// Restrict SNOMED CT expansions with multiple code systems, to simplify pagination.
 	// Nested value sets are supported provided they all resolve to the same single code system version -
 	// the nested criteria are folded into a single ECL query so pagination and totals remain correct.
-	private void validateSnomedExpansionSupported(boolean isSnomed, Set<FHIRCodeSystemVersion> allInclusionVersions) {
+	private void validateSnomedExpansionSupported(boolean isSnomed, Set<FHIRCodeSystemVersion> allInclusionVersions,
+			CodeSelectionCriteria codeSelectionCriteria) {
 		if (!isSnomed) {
+			return;
+		}
+		// A count of versions is not what makes an expansion hard to page; an unbounded
+		// constraint is. When every constraint across every version is an enumerated code set,
+		// the result is bounded and known before any query runs -- it is the union of the code
+		// lists -- so it can be materialised whole and paged in memory, with an exact total.
+		// That is the shape of a value set combining a few SNOMED concepts with a null-flavour
+		// or data-absent-reason code, which is how "asked and declined" is modelled in several
+		// national editions and which this restriction made inexpandable.
+		//
+		// ECL is what genuinely resists this: it can match millions of concepts, so the set
+		// cannot be materialised and paging really does need a cross-store strategy that does
+		// not exist yet. That case is still refused, and the message now says which case it is.
+		if (allInclusionVersions.size() > 1 && isEnumerableAcrossVersions(codeSelectionCriteria)) {
 			return;
 		}
 		if (allInclusionVersions.size() > 1) {
@@ -714,6 +733,115 @@ public class FHIRValueSetService implements FHIRConstants {
 	 * Expands concepts in-memory from tx-resource overlay CodeSystems when no Elasticsearch documents exist.
 	 * Mirrors the filter/active logic applied during Elasticsearch-based non-SNOMED expansion.
 	 */
+	/**
+	 * The largest enumerated mixed expansion that will be gathered whole.
+	 *
+	 * Enumerated does not mean small -- a compose can list tens of thousands of codes by hand.
+	 * Past this the request is REFUSED rather than truncated, because a silently short
+	 * expansion is indistinguishable from a value set that really does have that few codes.
+	 */
+	private static final int MAX_ENUMERATED_MIXED_CODES = 10_000;
+
+	/** Whether every constraint, at every depth, is an enumerated code set rather than a query. */
+	private static boolean isEnumerableAcrossVersions(CodeSelectionCriteria criteria) {
+		if (criteria.isAnyECL()) {
+			return false;
+		}
+		boolean inclusionsSimple = criteria.getInclusionConstraints().values().stream()
+				.flatMap(c -> c.constraintsFlattened().stream())
+				.allMatch(ConceptConstraint::isSimpleCodeSet);
+		boolean exclusionsSimple = criteria.getExclusionConstraints().values().stream()
+				.flatMap(c -> c.constraintsFlattened().stream())
+				.allMatch(ConceptConstraint::isSimpleCodeSet);
+		return inclusionsSimple && exclusionsSimple
+				&& criteria.getNestedSelections().stream().allMatch(FHIRValueSetService::isEnumerableAcrossVersions);
+	}
+
+	/**
+	 * Expand a value set that spans several code system versions, at least one of them SNOMED,
+	 * where every constraint enumerates its codes.
+	 *
+	 * Each version is asked for its own codes from its own store -- SNOMED from the SNOMED
+	 * branch, an overlay from its inline definition, anything else from the concept index --
+	 * and the results are concatenated and paged in memory. There is no cross-store pagination
+	 * problem to solve because there is no pagination: the whole set is small enough to hold,
+	 * and this method refuses rather than proceeding when it is not.
+	 *
+	 * Ordering matches buildInlineConceptsPage so that a mixed expansion and a single-system one
+	 * sort alike: display length when a filter is present, code otherwise.
+	 */
+	private Page<FHIRConcept> buildEnumeratedMixedConceptsPage(Set<FHIRCodeSystemVersion> versions,
+			CodeSelectionCriteria codeSelectionCriteria, String filter, boolean activeOnly, PageRequest pageRequest,
+			ValueSetExpansionParameters params, String displayLanguage, boolean includeDesignations) {
+
+		int declaredCodes = codeSelectionCriteria.getInclusionConstraints().values().stream()
+				.flatMap(c -> c.constraintsFlattened().stream())
+				.mapToInt(c -> c.getCodes() == null ? 0 : c.getCodes().size()).sum();
+		if (declaredCodes > MAX_ENUMERATED_MIXED_CODES) {
+			throw exception(format("This value set enumerates %s codes across several code systems, which is more than "
+							+ "the %s this server will gather in one expansion.", declaredCodes, MAX_ENUMERATED_MIXED_CODES),
+					OperationOutcome.IssueType.TOOCOSTLY, 422);
+		}
+
+		List<LanguageDialect> languageDialects = ControllerHelper.parseAcceptLanguageHeaderWithDefaultFallback(
+				FHIRHelper.getDisplayLanguage(params.getDisplayLanguage(), displayLanguage));
+
+		List<FHIRConcept> allConcepts = new ArrayList<>();
+		for (FHIRCodeSystemVersion version : versions) {
+			ConjunctionConstraints constraints = codeSelectionCriteria.getInclusionConstraints().get(version);
+			if (constraints == null) {
+				continue;
+			}
+			Set<String> codes = constraints.constraintsFlattened().stream()
+					.filter(ConceptConstraint::isSimpleCodeSet)
+					.flatMap(c -> c.getCodes().stream())
+					.collect(Collectors.toCollection(LinkedHashSet::new));
+			if (codes.isEmpty()) {
+				continue;
+			}
+			if (version.isOnSnomedBranch()) {
+				// Digits only: a SNOMED include can carry a code that is not an SCTID, and
+				// Long.parseLong on it would abort the whole expansion rather than skip one code.
+				List<Long> ids = codes.stream().filter(c -> c.matches("\\d+")).map(Long::parseLong).toList();
+				if (ids.isEmpty()) {
+					continue;
+				}
+				Map<String, ConceptMini> minis =
+						snomedConceptService.findConceptMinis(version.getSnomedBranch(), ids, languageDialects).getResultsMap();
+				for (Long id : ids) {
+					ConceptMini mini = minis.get(id.toString());
+					if (mini != null) {
+						allConcepts.add(new FHIRConcept(mini, version, includeDesignations));
+					}
+				}
+			} else if (version.getInlineCodeSystem() != null) {
+				allConcepts.addAll(collectInlineConceptsForVersion(version, codeSelectionCriteria, activeOnly, null));
+			} else {
+				allConcepts.addAll(conceptService.findConcepts(codes, version, PageRequest.of(0, codes.size())).getContent());
+			}
+		}
+
+		// The filter is applied here rather than per store, because the stores do not filter
+		// alike -- the concept index matches analyzed token prefixes, the inline path matches a
+		// lowercased substring -- and a mixed expansion that filtered differently depending on
+		// which system a concept came from would be indefensible.
+		List<FHIRConcept> matched = filter == null ? allConcepts : allConcepts.stream()
+				.filter(c -> c.getDisplay() != null && c.getDisplay().toLowerCase().contains(filter.toLowerCase()))
+				.collect(Collectors.toList());
+
+		if (filter != null) {
+			matched.sort(Comparator.comparingInt(c -> (c.getDisplay() != null ? c.getDisplay().length() : 0)));
+		} else {
+			matched.sort(Comparator.comparing(FHIRConcept::getCode));
+		}
+
+		int total = matched.size();
+		int offset = (int) pageRequest.getOffset();
+		int toIndex = Math.min(offset + pageRequest.getPageSize(), total);
+		List<FHIRConcept> page = offset < total ? new ArrayList<>(matched.subList(offset, toIndex)) : new ArrayList<>();
+		return new PageImpl<>(page, pageRequest, total);
+	}
+
 	private Page<FHIRConcept> buildInlineConceptsPage(Set<FHIRCodeSystemVersion> versions,
 			CodeSelectionCriteria codeSelectionCriteria, String filter, boolean activeOnly, PageRequest pageRequest) {
 
