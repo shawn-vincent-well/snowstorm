@@ -136,6 +136,8 @@ public class FHIRTestConfig extends TestConfig {
 		fhirConceptRepository.deleteAll();
 	}
 
+	private static final String SWEDISH_LANG_REFSET = "46011000052107";
+
 	private void createDummyConcepts(int sequence, List<Concept> concepts, boolean concrete) {
 		// Create dummy concept with descriptions and relationship
 		Concept concept = new Concept("25775" + sequence + "006")
@@ -146,7 +148,17 @@ public class FHIRTestConfig extends TestConfig {
 						.addDescription(new Description("Baked potato " + sequence)
 								.setTypeId(Concepts.SYNONYM)
 								.addLanguageRefsetMember(Concepts.US_EN_LANG_REFSET, Concepts.PREFERRED));
-		
+
+		// One concept carries a description in a language that is NOT English, so that a text
+		// search can be shown to reach it. Preferred in the Swedish language reference set only,
+		// which nothing else asks for, so the English display of every concept is unchanged.
+		if (sequence == 2) {
+			concept.addDescription(new Description("Bakad potatis")
+					.setTypeId(Concepts.SYNONYM)
+					.setLanguageCode("sv")
+					.addLanguageRefsetMember(SWEDISH_LANG_REFSET, Concepts.PREFERRED));
+		}
+
 		if (concrete) {
 			concept.addAxiom(new Relationship(Concepts.ISA, Concepts.SUBSTANCE),
 					Relationship.newConcrete(STRENGTH_NUMERATOR, ConcreteValue.newDecimal("#500")));

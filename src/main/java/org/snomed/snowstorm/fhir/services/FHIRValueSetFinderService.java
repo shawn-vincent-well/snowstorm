@@ -42,6 +42,7 @@ import static org.snomed.snowstorm.fhir.services.FHIRValueSetService.TX_ISSUE_TY
 import static org.snomed.snowstorm.fhir.services.FHIRValueSetService.NOT_FOUND;
 import static org.snomed.snowstorm.fhir.services.FHIRValueSetService.VS_INVALID;
 import static org.snomed.snowstorm.fhir.services.FHIRValueSetService.HL7_SD_OUTCOME_MESSAGE_ID;
+import java.util.Collections;
 
 @Service
 public class FHIRValueSetFinderService implements FHIRConstants, TxResourceAware {
@@ -390,9 +391,19 @@ public class FHIRValueSetFinderService implements FHIRConstants, TxResourceAware
 			conceptQuery.descriptionCriteria(descriptionCriteria -> {
 				descriptionCriteria.term(filter)
 						.type(defaultSearchDescTypeIds);
-				if (!orEmpty(languageDialects).isEmpty()) {
-					descriptionCriteria.searchLanguageCodes(languageDialects.stream().map(LanguageDialect::getLanguageCode).collect(Collectors.toSet()));
-				}
+				// Deliberately NOT scoped to the display language. Narrowing
+				// searchLanguageCodes to the requested display dialects conflates two
+				// different questions: "which descriptions may MATCH my search text" and
+				// "which term should be DISPLAYED back to me".
+				//
+				// The effect is severe on a partially translated edition, and silent. A
+				// type-ahead for an English term with a non-English displayLanguage searches
+				// only that language's descriptions, so the user types a word that is right
+				// there in the content and the picker returns nothing. Display language is
+				// still honoured, afterwards, when the matched concepts are labelled.
+				//
+				// Left explicit rather than deleted so the omission reads as a decision.
+				descriptionCriteria.searchLanguageCodes(Collections.emptySet());
 			});
 		}
 		return conceptQuery;
