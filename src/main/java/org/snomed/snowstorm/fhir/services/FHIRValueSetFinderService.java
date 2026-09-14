@@ -408,7 +408,28 @@ public class FHIRValueSetFinderService implements FHIRConstants, TxResourceAware
 			List<String> elasticAnalyzedWords = DescriptionService.analyze(termFilter, new StandardAnalyzer());
 			String searchTerm = DescriptionService.constructSearchTerm(elasticAnalyzedWords);
 			String query = DescriptionService.constructSimpleQueryString(searchTerm);
-			masterQuery.filter(Queries.queryStringQuery(FHIRConcept.Fields.DISPLAY, query, Operator.And, 2.0f)._toQuery());
+			// Match `display` OR `designations.value`, not `display` alone.
+			//
+			// Designations are stored, indexed, and returned by $lookup, but a single-field
+			// query over `display` meant they were never searched -- so every alternate name a
+			// code system carries was invisible to type-ahead while being perfectly visible to
+			// anyone who already knew the code. In one real fee-schedule code system 392 words
+			// occur in a designation and in no display anywhere: a filter on any of them
+			// returned nothing, for concepts whose designation contains exactly that word.
+			// That is the worst shape of failure for a picker, because the data is right there
+			// and the server will show it to you once you stop searching for it.
+			//
+			// Same principle as the language scoping above: which concepts MATCH must not be
+			// narrower than what is stored.
+			//
+			// The display clause keeps its 2.0f boost so that if this ever becomes a scored
+			// context an exact display hit outranks a designation hit. Today it cannot: this is
+			// a filter clause, which is unscored, and the caller sorts by displayLen regardless.
+			masterQuery.filter(bool()
+					.should(Queries.queryStringQuery(FHIRConcept.Fields.DISPLAY, query, Operator.And, 2.0f)._toQuery())
+					.should(Queries.queryStringQuery(FHIRConcept.Fields.DESIGNATION_VALUE, query, Operator.And, 1.0f)._toQuery())
+					.minimumShouldMatch("1")
+					.build()._toQuery());
 		}
 		return masterQuery;
 	}

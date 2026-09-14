@@ -43,6 +43,14 @@ public class FHIRConcept implements FHIRGraphNode {
 		String ANCESTORS = "ancestors";
 		String PROPERTIES = "properties";
 		String EXTENSIONS = "extensions";
+		// `designations` carries no @Field annotation, so Spring Data never names this path
+		// and there was no constant for it. The mapping exists all the same: Elasticsearch
+		// dynamic mapping gives designations.value a text mapping, which is what the $expand
+		// filter in FHIRValueSetFinderService searches. Named here rather than written as a
+		// literal at the query site. Declaring the field explicitly on the entity would be
+		// the more robust statement of the same thing, and is deliberately left out of this
+		// change: it alters the mapping of an existing index rather than the query over it.
+		String DESIGNATION_VALUE = "designations.value";
 	}
 
 	@Id

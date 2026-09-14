@@ -813,7 +813,18 @@ public class FHIRValueSetService implements FHIRConstants {
 		if (filter != null && !filter.isBlank()) {
 			String lowerFilter = filter.toLowerCase();
 			String display = concept.getDisplay() != null ? concept.getDisplay() : "";
-			if (!code.toLowerCase().contains(lowerFilter) && !display.toLowerCase().contains(lowerFilter)) return null;
+			// Designation values count here too. This is the second of two independent filter
+			// paths: an inline (tx-resource overlay) CodeSystem has no Elasticsearch documents,
+			// so it is filtered in memory here rather than by the query in
+			// FHIRValueSetFinderService.getFhirConceptQuery. Matching on code and display alone
+			// leaves an overlay CodeSystem blind to designations even once the Elasticsearch
+			// path can see them, so a term carried only by a designation is still missed.
+			// FHIRConcept(def, version) has already populated designations from
+			// CodeSystem.concept.designation, and getDesignations() never returns null.
+			boolean designationMatch = concept.getDesignations().stream()
+					.map(FHIRDesignation::getValue)
+					.anyMatch(value -> value != null && value.toLowerCase().contains(lowerFilter));
+			if (!code.toLowerCase().contains(lowerFilter) && !display.toLowerCase().contains(lowerFilter) && !designationMatch) return null;
 		}
 		return concept;
 	}
