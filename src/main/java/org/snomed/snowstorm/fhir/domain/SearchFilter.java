@@ -7,6 +7,7 @@ import org.apache.commons.lang3.NotImplementedException;
 import org.hl7.fhir.r4.model.CodeSystem;
 import org.hl7.fhir.r4.model.Enumerations.PublicationStatus;
 import org.hl7.fhir.r4.model.OperationOutcome.IssueType;
+import org.hl7.fhir.r4.model.IdType;
 import org.hl7.fhir.r4.model.StructureDefinition;
 import org.hl7.fhir.r4.model.UriType;
 import org.hl7.fhir.r4.model.ValueSet;
@@ -54,12 +55,22 @@ public class SearchFilter {
 				version != null;
 	}
 
+	/**
+	 * Hold the id part only, so that it can be compared against what the resources actually carry.
+	 *
+	 * This used to qualify the value with "ValueSet/" and compare that against Resource.getId(),
+	 * which returns the id unqualified for both ValueSet and CodeSystem -- so "ValueSet/x" was
+	 * matched against "x" and every _id search matched nothing. An empty searchset, no error, on a
+	 * parameter the endpoint advertises. IdType is used on both sides so a caller may pass either
+	 * form.
+	 */
 	public SearchFilter withId(String id) {
-		if (id != null && !id.startsWith("ValueSet/")) {
-			id = "ValueSet/" + id;
-		}
-		this.id = id;
+		this.id = id != null ? new IdType(id).getIdPart() : null;
 		return this;
+	}
+
+	private static boolean idMatches(String filterIdPart, String resourceId) {
+		return filterIdPart == null || filterIdPart.equals(new IdType(resourceId).getIdPart());
 	}
 
 	public String getId() {
@@ -235,7 +246,7 @@ public class SearchFilter {
 	}
 
 	private boolean valueSetMatchesIdentity(ValueSet vs, FHIRHelper fhirHelper) {
-		if (getId() != null && !getId().equals(vs.getId())) {
+		if (!idMatches(getId(), vs.getId())) {
 			return false;
 		}
 
@@ -287,7 +298,7 @@ public class SearchFilter {
 	}
 
 	private boolean codeSystemMatchesIdentity(CodeSystem cs, FHIRHelper fhirHelper) {
-		if (getId() != null && !getId().equals(cs.getId())) {
+		if (!idMatches(getId(), cs.getId())) {
 			return false;
 		}
 
