@@ -101,7 +101,10 @@ public class FHIRConceptMapProvider implements IResourceProvider, FHIRConstants 
 		try {
 			String url = urlType != null ? urlType.getValueAsString() : null;
 			notSupported("conceptMapVersion", conceptMapVersion);
-			notSupported("reverse", reverse);
+			// reverse is supported, so stop refusing it. Reading already-coded data needs
+			// the map backwards -- given a classification code, which concepts map to it --
+			// and the stored map already holds both halves.
+			boolean reverseTranslate = reverse != null && reverse.hasValue() && reverse.booleanValue();
 			List<LanguageDialect> languageDialects = ControllerHelper.parseAcceptLanguageHeader(request.getHeader(ACCEPT_LANGUAGE_HEADER));
 
 			// Get coding to translate
@@ -113,12 +116,12 @@ public class FHIRConceptMapProvider implements IResourceProvider, FHIRConstants 
 				coding.setVersion(url.substring(0, url.indexOf("?")));
 			}
 
-			Collection<FHIRConceptMap> maps = resolveMaps(conceptMap, url, coding, targetSystem, sourceValueSet, targetValueSet);
+			Collection<FHIRConceptMap> maps = resolveMaps(conceptMap, url, coding, targetSystem, sourceValueSet, targetValueSet, reverseTranslate);
 			if (maps.isEmpty()) {
 				throw exception("No suitable map found.", IssueType.NOTFOUND, 404);
 			}
 
-			Map<FHIRConceptMap, Collection<FHIRMapElement>> mapElements = findElementsByMap(maps, coding, targetSystem, languageDialects);
+			Map<FHIRConceptMap, Collection<FHIRMapElement>> mapElements = findElementsByMap(maps, coding, targetSystem, languageDialects, reverseTranslate);
 			return buildTranslationResult(mapElements, targetSystem, coding);
 		} finally {
 			TxResourceContext.clear();
@@ -142,11 +145,11 @@ public class FHIRConceptMapProvider implements IResourceProvider, FHIRConstants 
 		return codeableConcept.getCoding().getFirst();
 	}
 
-	private Collection<FHIRConceptMap> resolveMaps(ConceptMap conceptMap, String url, Coding coding, String targetSystem, String sourceValueSet, String targetValueSet) {
+	private Collection<FHIRConceptMap> resolveMaps(ConceptMap conceptMap, String url, Coding coding, String targetSystem, String sourceValueSet, String targetValueSet, boolean reverse) {
 		if (conceptMap != null) {
 			return Collections.singleton(new FHIRConceptMap(conceptMap));
 		}
-		Collection<FHIRConceptMap> maps = service.findMaps(url, coding, targetSystem, sourceValueSet, targetValueSet);
+		Collection<FHIRConceptMap> maps = service.findMaps(url, coding, targetSystem, sourceValueSet, targetValueSet, reverse);
 		// Check tx-resource overlay if Elasticsearch returned no matches
 		if (maps.isEmpty() && url != null) {
 			org.hl7.fhir.r4.model.Resource inlined = TxResourceContext.get().get(url);
@@ -157,10 +160,12 @@ public class FHIRConceptMapProvider implements IResourceProvider, FHIRConstants 
 		return maps;
 	}
 
-	private Map<FHIRConceptMap, Collection<FHIRMapElement>> findElementsByMap(Collection<FHIRConceptMap> maps, Coding coding, String targetSystem, List<LanguageDialect> languageDialects) {
+	// `reverse` is threaded through rather than held on a field, so the direction stays an
+	// explicit argument of the lookup rather than hidden state.
+	private Map<FHIRConceptMap, Collection<FHIRMapElement>> findElementsByMap(Collection<FHIRConceptMap> maps, Coding coding, String targetSystem, List<LanguageDialect> languageDialects, boolean reverseTranslate) {
 		Map<FHIRConceptMap, Collection<FHIRMapElement>> mapElements = new HashMap<>();
 		for (FHIRConceptMap map : maps) {
-			Collection<FHIRMapElement> foundElements = service.findMapElements(map, coding, targetSystem, languageDialects);
+			Collection<FHIRMapElement> foundElements = service.findMapElements(map, coding, targetSystem, languageDialects, reverseTranslate);
 			if (!foundElements.isEmpty()) {
 				mapElements.put(map, foundElements);
 			}

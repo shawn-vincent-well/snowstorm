@@ -187,6 +187,19 @@ public class FHIRConceptMapService {
 	}
 
 	Collection<FHIRConceptMap> findMaps(String url, Coding coding, String targetSystem, String sourceValueSet, String targetValueSet) {
+		return findMaps(url, coding, targetSystem, sourceValueSet, targetValueSet, false);
+	}
+
+	/**
+	 * Map SELECTION has to flip for a reverse translate, not just group filtering.
+	 *
+	 * Found by running the conformance suite rather than by reading: reverse translate returned
+	 * "No suitable map found." because this filter matched the coding's system against
+	 * GROUP_SOURCE before findMapElements was ever reached. Flipping the group filter
+	 * inside findMapElements was necessary but not sufficient -- the candidate maps were
+	 * already gone.
+	 */
+	Collection<FHIRConceptMap> findMaps(String url, Coding coding, String targetSystem, String sourceValueSet, String targetValueSet, boolean reverse) {
 		BoolQuery.Builder query = bool();
 		List<Predicate<FHIRConceptMap>> snomedPredicates = new ArrayList<>();
 		if (url != null) {
@@ -198,12 +211,22 @@ public class FHIRConceptMapService {
 			snomedPredicates.add(map -> finalUrl.equals(map.getUrl()));
 		}
 		if (coding != null) {
-			query.must(termQuery(FHIRConceptMap.Fields.GROUP_SOURCE, coding.getSystem()));
-			snomedPredicates.add(map -> (map.getSourceUri() == null || map.getSourceUri().startsWith(coding.getSystem().replace("/xsct", "/sct"))));
+			// When reversing, the code we were given lives on the map's TARGET side.
+			query.must(termQuery(reverse ? FHIRConceptMap.Fields.GROUP_TARGET : FHIRConceptMap.Fields.GROUP_SOURCE, coding.getSystem()));
+			snomedPredicates.add(map -> reverse
+					? (map.getTargetUri() == null || map.getTargetUri().startsWith(coding.getSystem().replace("/xsct", "/sct")))
+					: (map.getSourceUri() == null || map.getSourceUri().startsWith(coding.getSystem().replace("/xsct", "/sct"))));
 		}
 		if (targetSystem != null) {
-			query.must(termQuery(FHIRConceptMap.Fields.GROUP_TARGET, targetSystem));
-			snomedPredicates.add(map -> map.getTargetUri().equals(targetSystem + WHOLE_SYSTEM_VALUE_SET_URI_POSTFIX));
+			// Reversed, the answer comes off the map's SOURCE side, so that is what
+			// targetSystem narrows. Left on GROUP_TARGET it contradicts the coding clause
+			// above -- both constraining the same field to different systems -- and no map
+			// can ever be selected, which surfaces as "No suitable map found" for a map that
+			// is sitting right there.
+			query.must(termQuery(reverse ? FHIRConceptMap.Fields.GROUP_SOURCE : FHIRConceptMap.Fields.GROUP_TARGET, targetSystem));
+			snomedPredicates.add(map -> reverse
+					? map.getSourceUri().equals(targetSystem + WHOLE_SYSTEM_VALUE_SET_URI_POSTFIX)
+					: map.getTargetUri().equals(targetSystem + WHOLE_SYSTEM_VALUE_SET_URI_POSTFIX));
 		}
 		if (sourceValueSet != null) {
 			query.must(bool(b -> b
@@ -238,25 +261,103 @@ public class FHIRConceptMapService {
 	}
 
 	public Collection<FHIRMapElement> findMapElements(FHIRConceptMap map, Coding coding, String targetSystem, List<LanguageDialect> languageDialects) {
+		return findMapElements(map, coding, targetSystem, languageDialects, false);
+	}
+
+	/**
+	 * `reverse=true` support, which was previously answered with notSupported.
+	 *
+	 * A reverse translate asks the map backwards -- given a target-side code, which source
+	 * concepts map to it. That is the direction a consumer needs when reading data that was
+	 * already coded in the target system, and the stored map holds both halves either way,
+	 * so refusing it was a gap rather than a missing capability.
+	 *
+	 * Group filtering flips too: forward matches on `group.source`, reverse on
+	 * `group.target`. Getting that wrong returns plausible-looking results from the wrong
+	 * groups, which is worse than an error.
+	 */
+	public Collection<FHIRMapElement> findMapElements(FHIRConceptMap map, Coding coding, String targetSystem,
+			List<LanguageDialect> languageDialects, boolean reverse) {
 		if (map.isImplicitSnomedMap()) {
-			return generateImplicitSnomedMapElements(map, coding, targetSystem, languageDialects);
+			return generateImplicitSnomedMapElements(map, coding, targetSystem, languageDialects, reverse);
 		}
 
 		List<FHIRConceptMapGroup> groups = map.getGroup().stream()
-				.filter(group -> group.getSource().equals(coding.getSystem()))
-				.filter(group -> targetSystem == null || group.getTarget().equals(targetSystem))
+				.filter(group -> reverse
+						? group.getTarget().equals(coding.getSystem())
+						: group.getSource().equals(coding.getSystem()))
+				.filter(group -> targetSystem == null || (reverse
+						? group.getSource().equals(targetSystem)
+						: group.getTarget().equals(targetSystem)))
 				.toList();
 		BoolQuery.Builder query = bool()
 				.must(termsQuery(FHIRMapElement.Fields.GROUP_ID, groups.stream().map(FHIRConceptMapGroup::getGroupId).toList()))
-				.must(termQuery(FHIRMapElement.Fields.CODE, coding.getCode()));
+				// TARGET_CODE is "target.code.keyword": target is a nested object and the
+				// analysed field will not term-match an exact code.
+				.must(reverse
+						? termQuery(FHIRMapElement.Fields.TARGET_CODE, coding.getCode())
+						: termQuery(FHIRMapElement.Fields.CODE, coding.getCode()));
 		NativeQueryBuilder queryBuilder = new NativeQueryBuilder()
 				.withQuery(query.build()._toQuery())
 				.withPageable(PAGE_OF_ONE_THOUSAND);
-		return searchForList(queryBuilder, FHIRMapElement.class);
+		List<FHIRMapElement> found = searchForList(queryBuilder, FHIRMapElement.class);
+		if (!reverse) {
+			return found;
+		}
+		// Restate each hit the way the caller consumes it: the element's own code is now
+		// the ANSWER, so it moves into the target slot. Keeps response building in the
+		// provider identical for both directions.
+		return found.stream()
+				.map(element -> new FHIRMapElement()
+						.setCode(coding.getCode())
+						.setTarget(Collections.singletonList(
+								new FHIRMapTarget(element.getCode(), reverseEquivalence(element), element.getDisplay()))))
+				.toList();
 	}
 
-	private Collection<FHIRMapElement> generateImplicitSnomedMapElements(FHIRConceptMap map, Coding coding, String targetSystem, List<LanguageDialect> languageDialects) {
-		FHIRCodeSystemVersionParams versionParams = FHIRHelper.getCodeSystemVersionParams((IdType) null, null, null, coding);
+	/**
+	 * A reversed mapping is only as strong as the forward one, and not always even that:
+	 * `narrower` reversed is `wider`, and vice versa. Everything else passes through --
+	 * equal/equivalent/unmatched are direction-neutral, and guessing at the rest would
+	 * overstate what the map actually asserts.
+	 */
+	private String reverseEquivalence(FHIRMapElement element) {
+		if (element.getTarget() == null || element.getTarget().isEmpty()) {
+			return null;
+		}
+		String forward = element.getTarget().get(0).getEquivalence();
+		if ("narrower".equals(forward)) {
+			return "wider";
+		}
+		if ("wider".equals(forward)) {
+			return "narrower";
+		}
+		return forward;
+	}
+
+	private Collection<FHIRMapElement> generateImplicitSnomedMapElements(FHIRConceptMap map, Coding coding, String targetSystem,
+			List<LanguageDialect> languageDialects, boolean reverse) {
+		boolean snomedOnMapSource = FHIRHelper.isSnomedUri(map.getSourceUri());
+		boolean snomedOnMapTarget = FHIRHelper.isSnomedUri(map.getTargetUri());
+		// This path is NOT directionally symmetric on its own, though it reads as though it
+		// might be. Both the field it searches and the field it reads the answer out of are
+		// chosen from the shape of the MAP, while what actually decides them is which side the
+		// CALLER supplied a code for. Those coincide only going forwards.
+		//
+		// So the two sides swap roles under reversal, once, here: below this point "source"
+		// means the side the caller supplied and "target" means the side being answered with,
+		// and the rest of the method needs no further knowledge of the direction.
+		boolean hasSnomedSource = reverse ? snomedOnMapTarget : snomedOnMapSource;
+		boolean hasSnomedTarget = reverse ? snomedOnMapSource : snomedOnMapTarget;
+		// The reference set being read lives in SNOMED, so the version to query has to be
+		// resolved from the MAP's SNOMED side. Resolving it from the supplied coding works
+		// only while the caller happens to be holding a SNOMED code: for a reverse translate,
+		// or for any map whose SNOMED side is the target, the coding names a different code
+		// system entirely, whose getSnomedBranch() is null -- and findMembers rejects a null
+		// branch with "The path argument is required".
+		String snomedUri = snomedOnMapSource ? map.getSourceUri() : map.getTargetUri();
+		FHIRCodeSystemVersionParams versionParams =
+				FHIRHelper.getCodeSystemVersionParams((IdType) null, null, null, new Coding().setSystem(snomedUri));
 		FHIRCodeSystemVersion snomedVersion = fhirCodeSystemService.findCodeSystemVersionOrThrow(versionParams);
 
 		map.setUrl(map.getUrl().replace(SNOMED_URI + "?", snomedVersion.getVersion() + "?"));
@@ -264,8 +365,6 @@ public class FHIRConceptMapService {
 		MemberSearchRequest memberSearchRequest = new MemberSearchRequest()
 				.referenceSet(map.getSnomedRefsetId())
 				.active(true);
-		boolean hasSnomedSource = FHIRHelper.isSnomedUri(map.getSourceUri());
-		boolean hasSnomedTarget = FHIRHelper.isSnomedUri(map.getTargetUri());
 		if (!hasSnomedSource) {
 			memberSearchRequest.additionalField(ReferenceSetMember.AssociationFields.MAP_TARGET, coding.getCode());
 		} else {

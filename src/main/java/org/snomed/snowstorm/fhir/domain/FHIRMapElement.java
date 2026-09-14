@@ -21,6 +21,15 @@ public class FHIRMapElement {
 	public interface Fields {
 		String GROUP_ID = "groupId";
 		String CODE = "code";
+		/**
+		 * Nested target code, for reverse translation.
+		 *
+		 * `.keyword` is required. FHIRMapTarget declares @Field(Keyword) on `code`, but
+		 * the `target` list itself carries no @Field, so Spring Data maps the nested
+		 * object DYNAMICALLY: `target.code` ends up `text` with a `.keyword` subfield.
+		 * A term query against the analysed `target.code` silently matches nothing.
+		 */
+		String TARGET_CODE = "target.code.keyword";
 	}
 
 	@Id
